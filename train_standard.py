@@ -23,7 +23,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                      train_dl, valid_dl, epochs: int = 25, track_loss=False,
                      lr_scheduler=None, criterion: torch.nn.Module = MURALoss,
                      **kwargs):
-    output_file = './logs/onecycle_train.txt'
+    output_file = '/home/cwbennie/MURA_logs/onecycle_train.txt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())

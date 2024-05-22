@@ -168,7 +168,7 @@ def classSampling(X, y, samplesPerClass, numberOfClasses):
 
 def save_model(model: nn.Module, model_name: str):
     # function to save model weights
-    path = '/home/cwbennie/medical_ml/models/'+model_name
+    path = '/home/cwbennie/MURA_models/'+model_name
     torch.save(model.state_dict(), path)
 
 

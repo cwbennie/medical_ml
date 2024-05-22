@@ -21,7 +21,8 @@ from datasets import MuraData
 
 def train_triangular_policy(model, train_dl, valid_dl, criterion,
                             max_lr=0.04, epochs=5,
-                            output_file: str = './logs/triangular_train.txt'):
+                            output_file: str =
+                            '/home/cwbennie/MURA_logs/triangular_train.txt'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     idx = 0
     iterations = epochs*len(train_dl)
