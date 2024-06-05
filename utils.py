@@ -12,8 +12,9 @@ import pandas as pd
 import re
 import cv2
 import time
+import pickle
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, auc, roc_curve
 from tqdm import tqdm
 
 
@@ -393,7 +394,7 @@ def mura_model_eval(model: nn.Module, valid_dl: DataLoader,
     auc_score = compute_auc(probs=probs, y_vals=y_actuals)
     if not test:
         return np.mean(losses)
-    return np.mean(losses), auc_score
+    return np.mean(losses), auc_score, predictions, y_actuals
 
 
 def log_train(output_file: str, elapsed: float, losses: list,
@@ -420,7 +421,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                      train_dl, valid_dl, epochs: int = 25, track_loss=False,
                      lr_scheduler=None, criterion: torch.nn.Module = MURALoss,
                      args=None, **kwargs):
-    output_file = f'/home/cwbennie/MURA_logs/{args.log_file}'
+    output_file = f'/home/cwbennie/MURA_logs/{args.log_file}.txt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -439,7 +440,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
             kwargs['epochs'] = epochs
         scheduler = get_scheduler(name=lr_scheduler, optimizer=optimizer,
                                   epochs=epochs, **kwargs)
-        output_file = f'/home/cwbennie/MURA_logs/{lr_scheduler}_{args.log_file}'
+        output_file = f'/home/cwbennie/MURA_logs/{lr_scheduler}_{args.log_file}.txt'
     epoch_losses, auc_scores, val_losses = list(), list(), list()
     criterion = criterion.to(device)
     prev_val_auc = 0.0
@@ -461,9 +462,9 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
         epoch_losses.append(np.mean(losses))
         # print(f'Epoch finished: Loss -> {np.mean(losses)}')
         if valid_dl:
-            val_loss, epoch_auc = mura_model_eval(model, valid_dl,
-                                                  criterion=criterion,
-                                                  test=True)
+            val_loss, epoch_auc, preds, y_val = mura_model_eval(model, valid_dl,
+                                                                criterion=criterion,
+                                                                test=True)
             val_losses.append(val_loss)
             auc_scores.append(epoch_auc)
             # print(f'''Epoch Validation: Loss -> {val_loss}\n
@@ -476,13 +477,16 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
         if lr_scheduler is not None:
             scheduler.step()
     if track_loss:
-        return epoch_losses, val_losses, auc_scores
-
+        pkl_file = output_file.strip('.txt') + '.pkl'
+        with open(pkl_file, 'wb') as file:
+            pickle.dump((epoch_losses, val_losses, auc_scores, preds, y_val),
+                        file=file)
+        return (epoch_losses, val_losses, auc_scores, preds, y_val)
 
 def train_triangular_policy(model, train_dl, valid_dl, criterion,
                             max_lr=0.04, epochs=5, args=None,
                             track_loss=False):
-    output_file = f'/home/cwbennie/MURA_logs/triangular_{args.log_file}'
+    output_file = f'/home/cwbennie/MURA_logs/triangular_{args.log_file}.txt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     idx = 0
     iterations = epochs*len(train_dl)
@@ -508,8 +512,9 @@ def train_triangular_policy(model, train_dl, valid_dl, criterion,
             idx += 1
         epoch_losses.append(np.mean(losses))
         if valid_dl:
-            val_loss, val_auc = mura_model_eval(model, valid_dl,
-                                                criterion)
+            val_loss, val_auc, preds, y_val = mura_model_eval(model, valid_dl,
+                                                              criterion=criterion,
+                                                              test=True)
             val_losses.append(val_loss)
             auc_scores.append(val_auc)
             # print(f'''Epoch Validation: Loss -> {val_loss}\n
@@ -519,7 +524,11 @@ def train_triangular_policy(model, train_dl, valid_dl, criterion,
         prev_val_auc = compare_auc(val_auc, prev_val_auc, None,
                                    model, output_file)
     if track_loss:
-        return epoch_losses, val_losses, auc_scores
+        pkl_file = output_file.strip('.txt') + '.pkl'
+        with open(pkl_file, 'wb') as file:
+            pickle.dump((epoch_losses, val_losses, auc_scores, preds, y_val),
+                        file=file)
+        return (epoch_losses, val_losses, auc_scores, preds, y_val)
 
 
 def cosine_segment(start_lr, end_lr, iterations):
@@ -588,15 +597,35 @@ def get_chexpert_images(path: Path, label_csv: str,
     return images, labels
 
 
-def plot_losses(losses, mod_title):
+def plot_auc(roc_data, mod_title, save_path):
+    true_labels, pred_scores = roc_data
+    fpr, tpr, _ = roc_curve(true_labels, pred_scores)
+    roc_auc = auc(fpr, tpr)
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'{mod_title} - ROC Curve')
+    plt.legend(loc="lower right")
+    if save_path:
+        plt.savefig(os.path.join(save_path, f"{mod_title}_ROC.png"))
+    plt.show()
+
+
+def plot_losses(losses, mod_title, save_path):
     # Print and show the loss curves of various models, for both reconstruction and KLD
     labels = ['Training Loss', 'Validation Loss', 'AUC Scores']
     for loss, label in zip(losses, labels):
         plt.plot(loss, label=label)
         plt.title(f'{mod_title} - {label}')
         plt.xlabel('Epochs')
-        # TODO figure out how to save plot as image to file
-        # TODO Figure out plotting auc curve
+        y_lab = 'AUC Score' if label == 'AUC Scores' else 'Loss'
+        plt.ylabel(y_lab)
+        plt_title = f"{mod_title}_{label.replace(' ', '_')}.png"
+        plt.savefig(os.path.join(save_path, plt_title))
         plt.legend()
         plt.show()
 

@@ -63,7 +63,8 @@ class MoCo(nn.Module):
                 self.encoder_q.classifier = nn.Linear(num_ftrs, dim)
                 self.encoder_k.classifier = nn.Linear(num_ftrs, dim)
 
-        # add additional layer for final MLP
+        # add additional layer for final MLP classifier if you want
+        # a deeper classifier layer
         if mlp:
             if self.encoder_q.__class__.__name__.lower() == 'resnet':
                 dim_mlp = self.encoder_q.fc.weight.shape[1]

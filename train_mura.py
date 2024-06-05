@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from datasets import MuraData
 from models import MURANet, MURALoss
-from utils import train_triangular_policy, train_mura_model, plot_losses
+from utils import train_triangular_policy, train_mura_model, plot_losses, plot_auc
 
 parser = argparse.ArgumentParser(description="MURA X-Ray Training")
 parser.add_argument('--baseline_model', type=str, required=True,
@@ -24,6 +24,8 @@ parser.add_argument('--triangular_lr', type=float, default=0.001,
                     help='set the maximum learning rate for triangular training')
 parser.add_argument('--log_file', required=True, type=str,
                     help='add a suffix for the log file for the training')
+parser.add_argument('--img_dir', required=True, type=str,
+                    help='directory to save plot images from training')
 
 args = parser.parse_args()
 
@@ -42,17 +44,23 @@ def main():
     model = MURANet(args=args)
     loss = MURALoss()
     if args.train_method == 'triangular':
-        losses, val_losses, auc_scores = train_triangular_policy(
-            model, train_dl, test_dl, criterion=loss, max_lr=args.triangular_lr,
-            epochs=args.epochs, track_loss=True, args=args)
+        results = train_triangular_policy(model, train_dl, test_dl,
+                                          criterion=loss,
+                                          max_lr=args.triangular_lr,
+                                          epochs=args.epochs, track_loss=True,
+                                          args=args)
     else:
-        losses, val_losses, auc_scores = train_mura_model(
-            model=model, train_dl=train_dl, valid_dl=test_dl,
-            epochs=args.epochs, criterion=loss, lr_scheduler=args.train_method,
-            track_loss=True, args=args)
+        results = train_mura_model(model=model, train_dl=train_dl,
+                                   valid_dl=test_dl, epochs=args.epochs,
+                                   criterion=loss, lr_scheduler=args.train_method,
+                                   track_loss=True, args=args)
     
+    losses, val_losses, auc_scores, preds, y_val = results
     plot_losses([losses, val_losses, auc_scores],
-             mod_title=str(args.baseline_model).capitalize())
+             mod_title=str(args.baseline_model).capitalize(),
+             save_path=args.img_dir)
+    plot_auc((preds, y_val), mod_title=str(args.baseline_model).capitalize(),
+             save_path=args.img_dir)
 
 
 if __name__ == '__main__':
