@@ -68,13 +68,14 @@ class RotNetData(Dataset):
 
 
 class MuraData(Dataset):
-    def __init__(self, dir_path: Path, transform: bool = False):
+    def __init__(self, dir_path: Path, transform: bool = False,
+                 img_size: int = 320):
         self.image_dir = dir_path
         self.images, self.labels, self.cats = utils.get_mura_images(
             self.image_dir)
         if transform:
             self.transforms = A.Compose([
-                A.Resize(320, 320),
+                A.Resize(img_size, img_size),
                 A.HorizontalFlip(p=0.5),
                 A.Rotate(limit=30),
                 A.Normalize(mean=[0.485, 0.456, 0.406],
@@ -83,7 +84,7 @@ class MuraData(Dataset):
             ])
         else:
             self.transforms = A.Compose([
-                A.Resize(320, 320),
+                A.Resize(img_size, img_size),
                 A.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
@@ -100,3 +101,46 @@ class MuraData(Dataset):
         pos_cat_wt = self.pos_weights[self.cats[index]]
         neg_cat_wt = self.neg_weights[self.cats[index]]
         return image_arr, self.labels[index], (pos_cat_wt, neg_cat_wt)
+    
+    def train_dataloader(self, batch_size):
+        return DataLoader(dataset=self, batch_size=batch_size,
+                          shuffle=False)
+
+    def test_dataloader(self):
+        return DataLoader(dataset=self, batch_size=8, shuffle=False)
+
+
+class CheXpertData(Dataset):
+    def __init__(self, dir_path: Path, label_csv: Path,
+                 transform: bool = False, data_type: str = 'train',
+                 uncertainty_type: str = 'own_class'):
+        self.image_dir = dir_path
+        self.label_csv = label_csv
+        self.data_type = data_type
+        self.images, self.labels = utils.get_chexpert_images(
+            path=self.image_dir, label_csv=label_csv,
+            data_type=self.data_type, uncertainty_type=uncertainty_type)
+        if transform:
+            self.transforms = A.Compose([
+                A.Resize(320, 320),
+                A.HorizontalFlip(p=0.5),
+                A.Rotate(limit=30),
+                A.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+                ])
+        else:
+            self.transforms = A.Compose([
+                A.Resize(320, 320),
+                A.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+                ])
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        image = self.images[index]
+        image_arr = utils.transform_image(image, self.transforms)
+        return image_arr, self.labels[index]

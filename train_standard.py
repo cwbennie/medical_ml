@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torchvision import models
 from datetime import datetime
 import cv2
+import time
 import utils
 from models import MURALoss, MURANet
 from datasets import MuraData
@@ -23,7 +24,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                      train_dl, valid_dl, epochs: int = 25, track_loss=False,
                      lr_scheduler=None, criterion: torch.nn.Module = MURALoss,
                      **kwargs):
-    output_file = '/home/cwbennie/MURA_logs/onecycle_train.txt'
+    output_file = '/home/cwbennie/MURA_logs/onecycle_albumentations_resize2.log'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -39,6 +40,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
 
     # train the model for the given number of epochs
     for i in range(epochs):
+        start = time.time()
         losses = list()
         model.train()
         for img, y, weights in train_dl:
@@ -59,13 +61,15 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
             auc_scores.append(epoch_auc)
             print(f'''Epoch Validation: Loss -> {val_loss}\n
                   AUC Score -> {epoch_auc}\n''')
+        elapsed = time.time() - start
         with open(output_file, 'a') as file:
-            file.write(f'''Epoch {i+1}\n
-              Train: train_loss {np.mean(losses):.3f}\n
-              Val: val_loss {val_loss:.3f} val_auc {epoch_auc:.3f} \n''')
+            file.write(f'''Epoch {i+1} - Time: {elapsed:.3f}\n
+Train: train_loss {np.mean(losses):.3f}\n
+Val: val_loss {val_loss:.3f} val_auc {epoch_auc:.3f} \n''')
+
         if epoch_auc > prev_val_auc:
             prev_val_auc = epoch_auc
-            path = f"model_onecycle_auc_1_{100*epoch_auc:.0f}.pth"
+            path = f"model_onecycle_auc_{100*epoch_auc:.0f}.pth\n"
             utils.save_model(model, path)
             with open(output_file, 'a') as file:
                 file.write(f'''Model: {path}''')
@@ -78,7 +82,7 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
 def main():
     pth = Path('/home/cwbennie/data/MURA-v1.1/train')
     mura_train = MuraData(pth, transform=True)
-    train_dl = DataLoader(mura_train, batch_size=8, shuffle=True)
+    train_dl = DataLoader(mura_train, batch_size=40, shuffle=True)
 
     val_path = Path('/home/cwbennie/data/MURA-v1.1/valid')
     mura_test = MuraData(val_path, transform=False)

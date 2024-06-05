@@ -2,26 +2,37 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torchvision import models
 import numpy as np
 import albumentations as A
 from pathlib import Path
 import matplotlib.pyplot as plt
 import os
+import pandas as pd
 import re
 import cv2
+import time
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
 
 # Define Utilities
-def read_image(path):
-    im = cv2.imread(str(path))
-    return cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-
-
 def rotate_cv(im, deg, mode=cv2.BORDER_REFLECT, interpolation=cv2.INTER_AREA):
-    """ Rotates an image by deg degrees"""
+    """
+    Rotates an image by a specified degree.
+
+    Parameters:
+    - im (numpy.ndarray): Input image.
+    - deg (float): Degree to rotate the image.
+    - mode (int): Border mode to use during rotation
+                  (default is cv2.BORDER_REFLECT).
+    - interpolation (int): Interpolation method to use
+                           (default is cv2.INTER_AREA).
+
+    Returns:
+    - numpy.ndarray: Rotated image.
+    """
     r, c, *_ = im.shape
     M = cv2.getRotationMatrix2D((c/2, r/2), deg, 1)
     return cv2.warpAffine(im, M, (c, r), borderMode=mode,
@@ -29,11 +40,33 @@ def rotate_cv(im, deg, mode=cv2.BORDER_REFLECT, interpolation=cv2.INTER_AREA):
 
 
 def resize_image(path: Path, size: int):
+    """
+    Resizes an image to a specified size.
+
+    Parameters:
+    - path (Path): Path to the image file.
+    - size (int): New size for both dimensions of the image.
+
+    Returns:
+    - numpy.ndarray: Resized image.
+    """
     image = cv2.imread(str(path))
     return cv2.resize(image, (size, size))
 
 
 def resize_all_images(dir_path: Path, size: int):
+    """
+    Resizes all images in a specified directory to a given size and saves
+    them in a new directory.
+
+    Parameters:
+    - dir_path (Path): Directory containing images to resize.
+    - size (int): New size for both dimensions of each image.
+
+    Returns:
+    - None: Images are saved in a new directory, named as the original
+            directory followed by the specified size.
+    """
     new_path = Path(f'{str(dir_path)}_{str(size)}/')
     for dirc in dir_path.iterdir():
         dir_name = str(dirc).split('/')[-1]
@@ -49,11 +82,32 @@ def resize_all_images(dir_path: Path, size: int):
 
 
 def rotate_img(path: Path, rot: int):
+    """
+    Rotates an image by 90 degrees a specified number of times.
+
+    Parameters:
+    - path (Path): Path to the image file.
+    - rot (int): Number of times to rotate the image by 90 degrees.
+
+    Returns:
+    - numpy.ndarray: Rotated image.
+    """
     image = cv2.imread(str(path))
     return np.rot90(image, rot)
 
 
 def get_mura_category(filename: str):
+    """
+    Extracts the MURA category from a filename using a regular expression.
+    The categories will be used to compare performance across different
+    image types.
+
+    Parameters:
+    - filename (str): Filename to extract the category from.
+
+    Returns:
+    - str: MURA category extracted from the filename.
+    """
     xray_pattern = r'XR_([A-Z]+)'
     match = re.search(pattern=xray_pattern, string=filename)
     return match.group(1)
@@ -177,10 +231,10 @@ def load_model(model, path):
 
 
 def get_scheduler(name, optimizer, **kwargs):
-    if name == 'Step Decay':
+    if name == 'step_decay':
         # StepLR requires step_size: argument can be passed with kwargs
         scheduler = optim.lr_scheduler.StepLR(optimizer, **kwargs)
-    elif name == 'Exponential Decay':
+    elif name == 'exp_decay':
         # ExponentialLR requires gamma: argument passed with kwargs
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, **kwargs)
     else:
@@ -211,9 +265,8 @@ def model_eval(model, valid_dl, test=True):
     return predictions, y_actuals, probs
 
 
-# function to fine-tune ResNet on the sonar images
 def train_model(model: nn.Module, optimizer: torch.optim.Adam,
-                train_dl, valid_dl, epochs: int = 25, track_loss=False,
+                train_dl, valid_dl, epochs: int = 10, track_loss=False,
                 lr_scheduler=None, **kwargs):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
@@ -251,7 +304,6 @@ def train_model(model: nn.Module, optimizer: torch.optim.Adam,
 def update_image_dict(im_file: Path, image_dict: dict):
     img = cv2.imread(str(im_file))
     if img is not None:
-        # img = img.astype(np.float32)
         if image_dict.get('images'):
             image_dict['images'].append(im_file)
         else:
@@ -307,10 +359,13 @@ def compute_auc(probs, y_vals):
 class MURALoss(torch.nn.Module):
     def __init__(self):
         super(MURALoss, self).__init__()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available()
+                                   else 'cpu')
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor,
                 weights: tuple):
+        epsilon = 1e-6
+        predictions = torch.clamp(predictions, min=epsilon, max=1-epsilon)
         loss_pos_wts = torch.Tensor(weights[0]).to(self.device).float()
         loss_neg_wts = torch.Tensor(weights[1]).to(self.device).float()
         loss = -(loss_pos_wts * targets * predictions.log() +
@@ -321,14 +376,13 @@ class MURALoss(torch.nn.Module):
 def mura_model_eval(model: nn.Module, valid_dl: DataLoader,
                     criterion: MURALoss, test=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
     predictions = list()
     y_actuals = list()
     probs = list()
     losses = list()
     model.eval()
     for x_val, y_val, weights in valid_dl:
-        out = model(x_val.to(device))
+        out = model(x_val.to(device).float())
         y_val = y_val.to(device).float()
         loss = criterion(out.squeeze(), y_val, weights)
         losses.append(loss.item())
@@ -342,25 +396,57 @@ def mura_model_eval(model: nn.Module, valid_dl: DataLoader,
     return np.mean(losses), auc_score
 
 
-# function to fine-tune ResNet on the sonar images
+def log_train(output_file: str, elapsed: float, losses: list,
+              val_loss: float, epoch_auc: float):
+    with open(output_file, 'a') as file:
+            file.write(f'''Epoch {i+1} - Time: {elapsed:.3f}\n
+Train: train_loss {np.mean(losses):.3f}\n
+Val: val_loss {val_loss:.3f} val_auc {epoch_auc:.3f} \n''')
+
+
+def compare_auc(epoch_auc, prev_val_auc, lr_scheduler,
+                model, output_file):
+    if epoch_auc > prev_val_auc:
+        prev_val_auc = epoch_auc
+        tag = lr_scheduler if lr_scheduler else ''
+        path = f"model_{tag}_auc_{100*epoch_auc:.0f}.pth\n"
+        save_model(model, path)
+        with open(output_file, 'a') as file:
+            file.write(f'''Model: {path}''')
+    return prev_val_auc
+
+
 def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                      train_dl, valid_dl, epochs: int = 25, track_loss=False,
                      lr_scheduler=None, criterion: torch.nn.Module = MURALoss,
-                     **kwargs):
+                     args=None, **kwargs):
+    output_file = f'/home/cwbennie/MURA_logs/{args.log_file}'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optimizer(parameters, lr=0.0001, betas=(0.9, 0.999))
     if lr_scheduler is not None:
+        ## TODO need to check baselines with repo
+        if not kwargs.get('step_size'):
+            kwargs['step_size'] = epochs // 3
+        if not kwargs.get('gamma'):
+            kwargs['gamma'] = 0.95
+        if not kwargs.get('max_lr'):
+            kwargs['max_lr'] = 0.001
+        if not kwargs.get('steps_per_epoch'):
+            kwargs['steps_per_epoch'] = len(train_dl)
+        if not kwargs.get('epochs'):
+            kwargs['epochs'] = epochs
         scheduler = get_scheduler(name=lr_scheduler, optimizer=optimizer,
                                   epochs=epochs, **kwargs)
-    epoch_losses = list()
-    auc_scores = list()
-    val_losses = list()
+        output_file = f'/home/cwbennie/MURA_logs/{lr_scheduler}_{args.log_file}'
+    epoch_losses, auc_scores, val_losses = list(), list(), list()
     criterion = criterion.to(device)
+    prev_val_auc = 0.0
 
     # train the model for the given number of epochs
-    for i in tqdm(range(epochs), desc='Training', leave=True):
+    for i in range(epochs):
+        start = time.time()
         losses = list()
         model.train()
         for img, y, weights in train_dl:
@@ -373,19 +459,67 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
             optimizer.step()
             losses.append(loss.item())
         epoch_losses.append(np.mean(losses))
-        print(f'Epoch finished: Loss -> {np.mean(losses)}')
+        # print(f'Epoch finished: Loss -> {np.mean(losses)}')
         if valid_dl:
             val_loss, epoch_auc = mura_model_eval(model, valid_dl,
                                                   criterion=criterion,
                                                   test=True)
             val_losses.append(val_loss)
             auc_scores.append(epoch_auc)
-            print(f'''Epoch Validation: Loss -> {val_loss}\n
-                  AUC Score -> {epoch_auc}\n''')
+            # print(f'''Epoch Validation: Loss -> {val_loss}\n
+            #       AUC Score -> {epoch_auc}\n''')
+        elapsed = time.time() - start
+        log_train(output_file, elapsed, losses,
+                  val_loss, epoch_auc)
+        prev_val_auc = compare_auc(epoch_auc, prev_val_auc, lr_scheduler,
+                                   model, output_file)
         if lr_scheduler is not None:
             scheduler.step()
     if track_loss:
-        return epoch_losses, val_losses
+        return epoch_losses, val_losses, auc_scores
+
+
+def train_triangular_policy(model, train_dl, valid_dl, criterion,
+                            max_lr=0.04, epochs=5, args=None,
+                            track_loss=False):
+    output_file = f'/home/cwbennie/MURA_logs/triangular_{args.log_file}'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    idx = 0
+    iterations = epochs*len(train_dl)
+    lrs = get_cosine_triangular_lr(max_lr, iterations)
+    optimizer = create_optimizer(model, lrs[0])
+    prev_val_auc = 0.0
+    epoch_losses, auc_scores, val_losses = list(), list(), list()
+    for j in range(epochs):
+        start = time.time()
+        model.train()
+        losses = list()
+        for i, (img, y, wts) in enumerate(train_dl):
+            lr = lrs[idx]
+            update_optimizer(optimizer, [lr/9, lr/3, lr])
+            img = img.to(device).float()
+            y = y.to(device).float()
+            out = model(img)
+            loss = criterion(out.squeeze(), y, wts)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+            idx += 1
+        epoch_losses.append(np.mean(losses))
+        if valid_dl:
+            val_loss, val_auc = mura_model_eval(model, valid_dl,
+                                                criterion)
+            val_losses.append(val_loss)
+            auc_scores.append(val_auc)
+            # print(f'''Epoch Validation: Loss -> {val_loss}\n
+            #       AUC Score -> {val_auc}\n''')
+        elapsed = time.time() - start
+        log_train(output_file, elapsed, losses, val_loss, val_auc)
+        prev_val_auc = compare_auc(val_auc, prev_val_auc, None,
+                                   model, output_file)
+    if track_loss:
+        return epoch_losses, val_losses, auc_scores
 
 
 def cosine_segment(start_lr, end_lr, iterations):
@@ -417,3 +551,114 @@ def create_optimizer(model, lr_0):
 def update_optimizer(optimizer, group_lrs):
     for i, param_group in enumerate(optimizer.param_groups):
         param_group["lr"] = group_lrs[i]
+
+
+# Begin Functions for CheXpert
+def get_chexpert_labels(path: Path, dataframe: pd.DataFrame,
+                        data_type: str = 'train'):
+    file_name = str(path).split('/')[6:]
+    file_name = '/'.join(file_name)
+    full_id = f'CheXpert-v1.0/{data_type}/' + file_name
+    return list(dataframe.loc[full_id].values)[4:]
+
+
+def get_chexpert_images(path: Path, label_csv: str,
+                        data_type: str = 'train',
+                        uncertainty_type: str = 'own_class'):
+    images = list()
+    label_info = pd.read_csv(label_csv)
+    label_info.fillna(0.0, inplace=True)
+    if uncertainty_type == 'own_class':
+        label_info.replace(-1, 2, inplace=True)
+    elif uncertainty_type == 'pos_replace':
+        label_info.replace(-1, 1, inplace=True)
+    else:
+        label_info.replace(-1, 0, inplace=True)
+    label_info.set_index('Path', inplace=True)
+    labels = list()
+    for dirpath, dirnames, files in os.walk(Path(path)):
+        for file in files:
+            if file.endswith('jpg'):
+                im_file = os.path.join(dirpath, file)
+                # img = cv2.imread(str(im_file)).astype(np.float32)
+                images.append(im_file)
+                label = get_chexpert_labels(im_file, label_info, data_type)
+                labels.append(label)
+    print(f'Dataset size: {len(labels)} images')
+    return images, labels
+
+
+def plot_losses(losses, mod_title):
+    # Print and show the loss curves of various models, for both reconstruction and KLD
+    labels = ['Training Loss', 'Validation Loss', 'AUC Scores']
+    for loss, label in zip(losses, labels):
+        plt.plot(loss, label=label)
+        plt.title(f'{mod_title} - {label}')
+        plt.xlabel('Epochs')
+        # TODO figure out how to save plot as image to file
+        # TODO Figure out plotting auc curve
+        plt.legend()
+        plt.show()
+
+
+def get_model(model_name):
+    if model_name == 'resnet18':
+        model = models.resnet18(weights='DEFAULT')
+    elif model_name == 'resnet34':
+        model = models.resnet34(weights='DEFAULT')
+    elif model_name == 'resnet50':
+        model = models.resnet50(weights='DEFAULT')
+    elif model_name == 'mobilenet_large':
+        model = models.mobilenet_v3_large(weights='DEFAULT')
+    elif model_name == 'densenet121':
+        model = models.densenet121(weights='DEFAULT')
+    elif model_name == 'densenet161':
+        model = models.densenet161(weights='DEFAULT')
+    elif model_name == 'densenet169':
+        model = models.densenet169(weights='DEFAULT')
+    return model
+
+
+def get_base(model_name: str):
+    model = get_model(model_name)
+    if model_name.startswith('densenet'):
+        layers = list(model.children())[0] # check if this holds up for all densenets
+    elif model_name.startswith('resnet'):
+        layers = list(model.children())[:8]  # need to check to see if this holds up for all resnets
+    elif model_name.startswith('mobilenet'):
+        layers = nn.Sequential(model.features)
+    return layers
+
+
+def get_classifier(model_name: str, output: int):
+    if model_name.startswith('densenet'):
+        classifer = nn.Linear(1024, output)
+    elif model_name.startswith('resnet'):
+        classifer = nn.Linear(512, output)
+    elif model_name.startswith('mobilenet'): 
+        classifer = nn.Sequential(
+            nn.Linear(960, 1280),
+            nn.Hardswish(),
+            nn.Dropout(p=0.2),
+            nn.Linear(1280, output)
+        )
+    return classifer
+
+
+def get_layers(model_name, output):
+    mod_names = ['resnet18', 'resnet34', 'resnet50', 'mobilenet_large',
+                 'densenet121', 'densenet161', 'densenet169']
+    if model_name not in mod_names:
+        model_name = 'densenet121'
+    base_model = get_base(model_name)
+    classifier = get_classifier(model_name, output)
+    global_pool = nn.AdaptiveAvgPool2d((1, 1))
+    return base_model, classifier, global_pool
+    
+
+def get_groups(base_layers, classifier):
+    # need to check if we can break layers up into 3 for resnet and mobilenet
+    groups = nn.ModuleList([nn.Sequential(*h) for h in 
+                            [base_layers[:7], base_layers[7:]]])
+    groups.append(classifier)
+    return groups

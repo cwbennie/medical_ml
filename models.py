@@ -129,18 +129,33 @@ class RotNet(nn.Module):
 
 
 class MURANet(nn.Module):
-    def __init__(self, output=1):
+    def __init__(self, output=1, args=None):
         super(MURANet, self).__init__()
-        densenet = models.densenet121(weights='DEFAULT')
-        layers = list(densenet.children())[0]
-        self.base_densenet = nn.Sequential(*layers)
-        self.fc = nn.Linear(1024, output)
+        # densenet = models.densenet121(weights='DEFAULT')
+        # layers = list(densenet.children())[0]
+        # self.base_densenet = nn.Sequential(*layers)
+        # self.fc = nn.Linear(1024, output)
+        base_model, classifier, global_pool = get_layers(
+            model_name=args.baseline_model,
+            output=output
+        )
+        self.base_model = base_model
+        self.classifier = classifier
+        self.global_pool = global_pool
+        if args.training_method == 'triangular':
+            self.groups = get_groups(base_model, classifier)
+            self.training_method = 'triangular'
 
     def forward(self, x):
-        img = torch.relu(self.base_densenet(x))
-        img = nn.AdaptiveAvgPool2d((1, 1))(img)
+        if self.training_method == 'triangular':
+            for group in self.groups[:-1]:
+                x = group(x)
+                img = torch.relu(x)
+        else:
+            img = torch.relu(self.base_model(x))
+        img = self.global_pool(img)
         img = img.view(img.size(0), -1)
-        img = self.fc(img)
+        img = self.classifier(img)
         img = torch.sigmoid(img)
         return img
 
@@ -150,7 +165,8 @@ class MURATriangular(nn.Module):
         super(MURATriangular, self).__init__()
         densenet = models.densenet121(weights='DEFAULT')
         layers = list(densenet.children())[0]
-        self.groups = nn.ModuleList([nn.Sequential(*h) for h in [layers[:7], layers[7:]]])
+        self.groups = nn.ModuleList([nn.Sequential(*h) for h in 
+                                     [layers[:7], layers[7:]]])
         self.groups.append(nn.Linear(1024, output))
 
     def forward(self, x):
@@ -161,4 +177,31 @@ class MURATriangular(nn.Module):
         img = img.view(img.size(0), -1)
         img = self.groups[-1](img)
         img = torch.sigmoid(img)
+        return img
+
+
+class ChexNet(nn.Module):
+    def __init__(self, output=14, binary=False,
+                 labels_per_class=3):
+        super(ChexNet, self).__init__()
+
+        self.labels_pc = labels_per_class
+        self.binary = binary
+        self.classes = output
+
+        densenet = models.densenet121(weights='DEFAULT')
+        layers = list(densenet.children())[0]
+        self.base_densenet = nn.Sequential(*layers)
+        if self.binary:
+            self.fc = nn.Linear(1024, self.classes)
+        else:
+            self.fc = nn.Linear(1024, self.classes * self.labels_pc)
+
+    def forward(self, x):
+        img = torch.relu(self.base_densenet(x))
+        img = nn.AdaptiveAvgPool2d((1, 1))(img)
+        img = img.view(img.size(0), -1)
+        img = self.fc(img)
+        if not self.binary:
+            img = img.view(-1, self.classes, self.labels_pc)
         return img
