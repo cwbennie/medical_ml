@@ -13,9 +13,10 @@ import re
 import cv2
 import time
 import pickle
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, auc, roc_curve
 from tqdm import tqdm
+import wandb
 
 
 # Define Utilities
@@ -234,13 +235,16 @@ def load_model(model, path):
 def get_scheduler(name, optimizer, **kwargs):
     if name == 'step_decay':
         # StepLR requires step_size: argument can be passed with kwargs
-        scheduler = optim.lr_scheduler.StepLR(optimizer, **kwargs)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, kwargs['step_size'])
     elif name == 'exp_decay':
         # ExponentialLR requires gamma: argument passed with kwargs
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, **kwargs)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer,
+                                                     kwargs['gamma'])
     else:
         # OneCycle requires max_lr, steps_per_epoch, epochs: pass with kwargs
-        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, **kwargs)
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, kwargs['max_lr'],
+                                                  kwargs['steps_per_epoch'],
+                                                  kwargs['epochs'])
     return scheduler
 
 
@@ -272,7 +276,7 @@ def train_model(model: nn.Module, optimizer: torch.optim.Adam,
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optimizer(parameters, lr=0.001, betas=(0.5, 0.999), eps=1)
+    optimizer = optimizer(parameters, lr=0.0001, betas=(0.9, 0.999), eps=1)
     if lr_scheduler is not None:
         scheduler = get_scheduler(name=lr_scheduler, optimizer=optimizer,
                                   **kwargs)
@@ -398,9 +402,9 @@ def mura_model_eval(model: nn.Module, valid_dl: DataLoader,
 
 
 def log_train(output_file: str, elapsed: float, losses: list,
-              val_loss: float, epoch_auc: float):
+              val_loss: float, epoch_auc: float, epoch_num: int):
     with open(output_file, 'a') as file:
-            file.write(f'''Epoch {i+1} - Time: {elapsed:.3f}\n
+        file.write(f'''Epoch {epoch_num+1} - Time: {elapsed:.3f}\n
 Train: train_loss {np.mean(losses):.3f}\n
 Val: val_loss {val_loss:.3f} val_auc {epoch_auc:.3f} \n''')
 
@@ -420,27 +424,30 @@ def compare_auc(epoch_auc, prev_val_auc, lr_scheduler,
 def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                      train_dl, valid_dl, epochs: int = 25, track_loss=False,
                      lr_scheduler=None, criterion: torch.nn.Module = MURALoss,
-                     args=None, **kwargs):
-    output_file = f'/home/cwbennie/MURA_logs/{args.log_file}.txt'
+                     args=None, wandb_proj: str = 'mura_ml', **kwargs):
+    wandb.init(project=wandb_proj, config=locals())
+    log_dir = '/home/cwbennie/MURA_logs/'
+    output_file = f'{log_dir}{args.log_file}.txt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     parameters = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optimizer(parameters, lr=0.0001, betas=(0.9, 0.999))
+    optimizer = optimizer(parameters, lr=args.learning_rate,
+                          betas=(0.9, 0.999))
     if lr_scheduler is not None:
-        ## TODO need to check baselines with repo
+        # TODO need to check baselines with repo
         if not kwargs.get('step_size'):
             kwargs['step_size'] = epochs // 3
         if not kwargs.get('gamma'):
             kwargs['gamma'] = 0.95
         if not kwargs.get('max_lr'):
-            kwargs['max_lr'] = 0.001
+            kwargs['max_lr'] = args.learning_rate * 2.5
         if not kwargs.get('steps_per_epoch'):
             kwargs['steps_per_epoch'] = len(train_dl)
         if not kwargs.get('epochs'):
             kwargs['epochs'] = epochs
         scheduler = get_scheduler(name=lr_scheduler, optimizer=optimizer,
-                                  epochs=epochs, **kwargs)
-        output_file = f'/home/cwbennie/MURA_logs/{lr_scheduler}_{args.log_file}.txt'
+                                  **kwargs)
+        output_file = f'{log_dir}{lr_scheduler}_{args.log_file}.txt'
     epoch_losses, auc_scores, val_losses = list(), list(), list()
     criterion = criterion.to(device)
     prev_val_auc = 0.0
@@ -460,22 +467,26 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
             optimizer.step()
             losses.append(loss.item())
         epoch_losses.append(np.mean(losses))
-        # print(f'Epoch finished: Loss -> {np.mean(losses)}')
         if valid_dl:
-            val_loss, epoch_auc, preds, y_val = mura_model_eval(model, valid_dl,
-                                                                criterion=criterion,
-                                                                test=True)
+            val_loss, auc, preds, y_val = mura_model_eval(model, valid_dl,
+                                                          criterion=criterion,
+                                                          test=True)
             val_losses.append(val_loss)
-            auc_scores.append(epoch_auc)
-            # print(f'''Epoch Validation: Loss -> {val_loss}\n
-            #       AUC Score -> {epoch_auc}\n''')
+            auc_scores.append(auc)
         elapsed = time.time() - start
         log_train(output_file, elapsed, losses,
-                  val_loss, epoch_auc)
-        prev_val_auc = compare_auc(epoch_auc, prev_val_auc, lr_scheduler,
+                  val_loss, auc, epoch_num=i)
+        wandb.log({'Epoch Loss': np.mean(losses),
+                   'Validation Loss': val_loss,
+                   'Validation AUC': auc})
+        prev_val_auc = compare_auc(auc, prev_val_auc, lr_scheduler,
                                    model, output_file)
         if lr_scheduler is not None:
             scheduler.step()
+    wandb.log({'roc': wandb.plot.roc_curve(y_val, preds,
+                                           labels=None,
+                                           classes_to_plot=None)})
+    wandb.finish()
     if track_loss:
         pkl_file = output_file.strip('.txt') + '.pkl'
         with open(pkl_file, 'wb') as file:
@@ -483,11 +494,15 @@ def train_mura_model(model: nn.Module, optimizer: torch.optim.Adam,
                         file=file)
         return (epoch_losses, val_losses, auc_scores, preds, y_val)
 
+
 def train_triangular_policy(model, train_dl, valid_dl, criterion,
                             max_lr=0.04, epochs=5, args=None,
+                            wandb_proj: str = 'mura_ml',
                             track_loss=False):
+    wandb.init(project=wandb_proj, config=locals())
     output_file = f'/home/cwbennie/MURA_logs/triangular_{args.log_file}.txt'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     idx = 0
     iterations = epochs*len(train_dl)
     lrs = get_cosine_triangular_lr(max_lr, iterations)
@@ -512,17 +527,23 @@ def train_triangular_policy(model, train_dl, valid_dl, criterion,
             idx += 1
         epoch_losses.append(np.mean(losses))
         if valid_dl:
-            val_loss, val_auc, preds, y_val = mura_model_eval(model, valid_dl,
-                                                              criterion=criterion,
-                                                              test=True)
+            val_loss, auc, preds, y_val = mura_model_eval(model, valid_dl,
+                                                          criterion=criterion,
+                                                          test=True)
             val_losses.append(val_loss)
-            auc_scores.append(val_auc)
-            # print(f'''Epoch Validation: Loss -> {val_loss}\n
-            #       AUC Score -> {val_auc}\n''')
+            auc_scores.append(auc)
         elapsed = time.time() - start
-        log_train(output_file, elapsed, losses, val_loss, val_auc)
-        prev_val_auc = compare_auc(val_auc, prev_val_auc, None,
+        wandb.log({'Epoch Loss': np.mean(losses),
+                   'Validation Loss': val_loss,
+                   'Validation AUC': auc})
+        log_train(output_file, elapsed, losses, val_loss, auc,
+                  epoch_num=i)
+        prev_val_auc = compare_auc(auc, prev_val_auc, None,
                                    model, output_file)
+    wandb.log({'roc': wandb.plot.roc_curve(y_val, preds,
+                                           labels=None,
+                                           classes_to_plot=None)})
+    wandb.finish()
     if track_loss:
         pkl_file = output_file.strip('.txt') + '.pkl'
         with open(pkl_file, 'wb') as file:
@@ -598,11 +619,12 @@ def get_chexpert_images(path: Path, label_csv: str,
 
 
 def plot_auc(roc_data, mod_title, save_path):
-    true_labels, pred_scores = roc_data
+    pred_scores, true_labels = roc_data
     fpr, tpr, _ = roc_curve(true_labels, pred_scores)
     roc_auc = auc(fpr, tpr)
     plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+    plt.plot(fpr, tpr, color='darkorange', lw=2,
+             label=f'ROC curve (area = {roc_auc:.2f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
@@ -616,17 +638,17 @@ def plot_auc(roc_data, mod_title, save_path):
 
 
 def plot_losses(losses, mod_title, save_path):
-    # Print and show the loss curves of various models, for both reconstruction and KLD
-    labels = ['Training Loss', 'Validation Loss', 'AUC Scores']
+    # Print and show the loss curves and AUC
+    labels = ['Training Loss', 'Validation Loss']
     for loss, label in zip(losses, labels):
         plt.plot(loss, label=label)
         plt.title(f'{mod_title} - {label}')
         plt.xlabel('Epochs')
-        y_lab = 'AUC Score' if label == 'AUC Scores' else 'Loss'
-        plt.ylabel(y_lab)
-        plt_title = f"{mod_title}_{label.replace(' ', '_')}.png"
-        plt.savefig(os.path.join(save_path, plt_title))
+        plt.ylabel('Loss')
         plt.legend()
+        if label == 'Validation Loss':
+            plt_title = f"{mod_title}_{label.replace(' ', '_')}.png"
+            plt.savefig(os.path.join(save_path, plt_title))
         plt.show()
 
 
@@ -651,7 +673,7 @@ def get_model(model_name):
 def get_base(model_name: str):
     model = get_model(model_name)
     if model_name.startswith('densenet'):
-        layers = list(model.children())[0] # check if this holds up for all densenets
+        layers = list(model.children())[0]  # check if this holds up for all densenets
     elif model_name.startswith('resnet'):
         layers = list(model.children())[:8]  # need to check to see if this holds up for all resnets
     elif model_name.startswith('mobilenet'):
@@ -664,7 +686,7 @@ def get_classifier(model_name: str, output: int):
         classifer = nn.Linear(1024, output)
     elif model_name.startswith('resnet'):
         classifer = nn.Linear(512, output)
-    elif model_name.startswith('mobilenet'): 
+    elif model_name.startswith('mobilenet'):
         classifer = nn.Sequential(
             nn.Linear(960, 1280),
             nn.Hardswish(),
@@ -683,11 +705,11 @@ def get_layers(model_name, output):
     classifier = get_classifier(model_name, output)
     global_pool = nn.AdaptiveAvgPool2d((1, 1))
     return base_model, classifier, global_pool
-    
+
 
 def get_groups(base_layers, classifier):
     # need to check if we can break layers up into 3 for resnet and mobilenet
-    groups = nn.ModuleList([nn.Sequential(*h) for h in 
+    groups = nn.ModuleList([nn.Sequential(*h) for h in
                             [base_layers[:7], base_layers[7:]]])
     groups.append(classifier)
     return groups

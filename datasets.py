@@ -101,10 +101,10 @@ class MuraData(Dataset):
         pos_cat_wt = self.pos_weights[self.cats[index]]
         neg_cat_wt = self.neg_weights[self.cats[index]]
         return image_arr, self.labels[index], (pos_cat_wt, neg_cat_wt)
-    
+
     def train_dataloader(self, batch_size):
         return DataLoader(dataset=self, batch_size=batch_size,
-                          shuffle=False)
+                          shuffle=True)
 
     def test_dataloader(self):
         return DataLoader(dataset=self, batch_size=8, shuffle=False)

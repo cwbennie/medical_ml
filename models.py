@@ -142,9 +142,11 @@ class MURANet(nn.Module):
         self.base_model = base_model
         self.classifier = classifier
         self.global_pool = global_pool
-        if args.training_method == 'triangular':
+        if args.train_method == 'triangular':
             self.groups = get_groups(base_model, classifier)
             self.training_method = 'triangular'
+        else:
+            self.training_method = 'other'
 
     def forward(self, x):
         if self.training_method == 'triangular':
