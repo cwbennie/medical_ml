@@ -21,6 +21,7 @@ from models import ChexNet
 from datasets import CheXpertData
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
+import wandb
 
 
 def setup(rank, world_size):
@@ -51,7 +52,12 @@ def model_setup(dataset: Dataset,
 
 
 def ave_auc(probs, ys):
-    aucs = [roc_auc_score(ys[:, i], probs[:, i]) for i in range(probs.shape[1])]
+    aucs = list()
+    for i in range(probs.shape[1]):
+        try:
+            aucs.append(roc_auc_score(ys[:, i], probs[:, i]))
+        except ValueError as e:
+            print(f'Error: {e}')
     return np.mean(aucs), aucs
 
 
@@ -62,9 +68,13 @@ def cuda2cpu_regression(y: torch.Tensor): return y.cpu().numpy()
 
 
 def validate_loop(model: nn.Module, valid_dl: DataLoader, task: str):
-    if task == 'binary' or task == 'multilabel':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if task == 'binary':
         cuda2cpu = cuda2cpu_classification
-        loss_fun = F.binary_cross_entropy_with_logits
+        loss_fun = nn.BCEWithLogitsLoss()
+    elif task == 'multilabel':
+        cuda2cpu = cuda2cpu_classification
+        loss_fun = nn.CrossEntropyLoss()
     elif task == 'regression':
         cuda2cpu = cuda2cpu_regression
         loss_fun = F.l1_loss
@@ -76,27 +86,114 @@ def validate_loop(model: nn.Module, valid_dl: DataLoader, task: str):
     preds = []
 
     for x, y in valid_dl:
-        out = model(x).squeeze()
-        loss = loss_fun(out.squeeze(), y)
+        out = model(x.to(device))
+        y = y.to(device)
+        loss = loss_fun(out, y)
+        ys.append(cuda2cpu(y))
 
         batch = y.shape[0]
         sum_loss += batch * (loss.item())
         total += batch
 
-        preds.append(out.squeeze().detach().cpu().numpy())
-        ys.append(cuda2cpu(y))
+        preds.append(out.detach().cpu().numpy())
+
     return sum_loss/total, preds, ys
 
 
-def validate_multilabel(model, valid_dl):
-    loss, preds, ys = validate_loop(model, valid_dl, 'multilabel')
+def validate_multilabel(model, valid_dl, task: str = 'binary'):
+    loss, preds, ys = validate_loop(model, valid_dl, task)
 
-    preds = np.vstack(preds)
-    ys = np.vstack(ys)
-
-    mean_auc, aucs = ave_auc(preds, ys)
-
+    preds = np.concatenate(preds)
+    ys = np.concatenate(ys)
+    mean_auc, aucs = ave_auc(preds, ys) if len(np.unique(ys)) > 1 else None
     return loss, mean_auc, aucs
+
+
+def multilabel_loss(criterion: nn.Module, out: torch.Tensor, y: torch.Tensor):
+    """
+    Function to calculate Cross Entropy Loss across multiple labels
+    for multi-class models.
+    """
+    if out.dim() > 2:
+        out = out.view(-1, out.size(-1))
+    if y.dim() > 1:
+        y = y.view(-1)
+
+    loss = criterion(out, y.long())
+    return loss
+
+
+def log_train(output_file: str, elapsed: float, losses: list,
+              val_loss: float, epoch_auc: float, epoch_num: int):
+    with open(output_file, 'a') as file:
+        file.write(f'''Epoch {epoch_num+1} - Time: {elapsed:.3f}\n
+Train: train_loss {np.mean(losses):.3f}\n
+Val: val_loss {val_loss:.3f} val_auc {epoch_auc:.3f} \n''')
+
+
+def train_chex_model(model: nn.Module, optimizer: torch.optim.Adam,
+                     train_dl: DataLoader, valid_dl: DataLoader,
+                     epochs: int = 25, track_loss=False,
+                     lr_scheduler=None,
+                     criterion=nn.CrossEntropyLoss(),
+                     wandb_proj: str = 'chexpert_ml',
+                     args=None,
+                     **kwargs):
+    wandb.init(project=wandb_proj, config=locals())
+    log_dir = '/home/cwbennie/chexpert_logs/'
+    output_file = f'{log_dir}chexpert_test.txt'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    parameters = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = optimizer(parameters, lr=0.0001, betas=(0.9, 0.999))
+    if lr_scheduler is not None:
+        # TODO need to check baselines with repo
+        if not kwargs.get('step_size'):
+            kwargs['step_size'] = epochs // 3
+        if not kwargs.get('gamma'):
+            kwargs['gamma'] = 0.95
+        if not kwargs.get('max_lr'):
+            kwargs['max_lr'] = args.learning_rate * 2.5
+        if not kwargs.get('steps_per_epoch'):
+            kwargs['steps_per_epoch'] = len(train_dl)
+        if not kwargs.get('epochs'):
+            kwargs['epochs'] = epochs
+        scheduler = utils.get_scheduler(name=lr_scheduler, optimizer=optimizer,
+                                        epochs=epochs, **kwargs)
+        output_file = f'{log_dir}{lr_scheduler}_chexpert_test.txt'
+    epoch_losses, auc_scores, val_losses = list(), list(), list()
+    prev_val_auc = 0.0
+
+    # train the model for the given number of epochs
+    for ep in range(epochs):
+        start = time.time()
+        losses = list()
+        model.train()
+        for i, (img, y) in enumerate(train_dl):
+            img = img.to(device).float()
+            y = y.to(device)
+            out = model(img)
+            loss = criterion(out, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+        epoch_losses.append(np.mean(losses))
+        if valid_dl:
+            val_loss, epoch_auc, _ = validate_multilabel(model, valid_dl)
+            val_losses.append(val_loss)
+            auc_scores.append(epoch_auc)
+        elapsed = time.time() - start
+        log_train(output_file, elapsed, losses,
+                  val_loss, epoch_auc, epoch_num=ep+1)
+        wandb.log({'Epoch Loss': np.mean(losses),
+                   'Validation Loss': val_loss,
+                   'Validation AUC': epoch_auc})
+        if lr_scheduler is not None:
+            scheduler.step()
+    wandb.finish()
+    if track_loss:
+        return epoch_losses, val_losses
 
 
 def train_chex_model_dist(rank, optimizer: torch.optim.Adam,
@@ -148,8 +245,8 @@ def train_chex_model_dist(rank, optimizer: torch.optim.Adam,
         #     auc_scores.append(epoch_auc)
         #     print(f'''Epoch Validation: Loss -> {val_loss}\n
         #           AUC Score -> {epoch_auc}\n''')
-        # if lr_scheduler is not None:
-        #     scheduler.step()
+        if lr_scheduler is not None:
+            scheduler.step()
 
     cleanup()
 
@@ -164,27 +261,44 @@ def train_chex_model_dist(rank, optimizer: torch.optim.Adam,
 def main():
     chex_dir = Path('/home/cwbennie/data/chexpert_xrays/CheXpert_v1.0_train')
     train_csv = '/home/cwbennie/data/chexpert_xrays/chexpert_csv_files/train.csv'
-    chex_data = CheXpertData(chex_dir, train_csv, transform=True)    
-    # train_dl = DataLoader(chex_data, batch_size=40, shuffle=True)
+    chex_data = CheXpertData(chex_dir, train_csv, transform=True,
+                             uncertainty_type='pos_replace')    
+    train_dl = DataLoader(chex_data, batch_size=40, shuffle=True)
 
     valid_dir = Path(
         '/home/cwbennie/data/chexpert_xrays/CheXpert_v1.0_validation')
     val_csv = '/home/cwbennie/data/chexpert_xrays/chexpert_csv_files/valid.csv'
     val_data = CheXpertData(valid_dir, val_csv, transform=False,
-                            data_type='valid')
+                            data_type='valid', uncertainty_type='pos_replace')
     valid_dl = DataLoader(val_data, batch_size=8, shuffle=False)
 
-    world_size = 2
+    model = ChexNet(labels_per_class=2, binary=True)
+    train_chex_model(model=model, optimizer=torch.optim.Adam,
+                     train_dl=train_dl, valid_dl=valid_dl,
+                     epochs=10, labels_per_class=2,
+                     criterion=nn.BCEWithLogitsLoss())
+
+    # multi_data = CheXpertData(chex_dir, train_csv, transform=True,
+    #                           uncertainty_type='own_class')
+    # multi_dl = DataLoader(multi_data, batch_size=40, shuffle=True)
+    # multinet = ChexNet(output=14, binary=False, labels_per_class=3)
+
+    # train_chex_model(model=multinet, optimizer=torch.optim.Adam,
+    #                  train_dl=multi_dl, valid_dl=valid_dl,
+    #                  epochs=10, labels_per_class=3,
+    #                  criterion=nn.CrossEntropyLoss())
+
+    # world_size = 2
 
     # model = model.to(device)
-    mp.spawn(
-        train_chex_model_dist,
-        args=(torch.optim.Adam, chex_data, valid_dl,
-              world_size, 25, False, 'OneCycle',
-              nn.CrossEntropyLoss()),
-        nprocs=world_size,
-        join=True
-    )
+    # mp.spawn(
+    #     train_chex_model_dist,
+    #     args=(torch.optim.Adam, chex_data, valid_dl,
+    #           world_size, 25, False, 'OneCycle',
+    #           nn.CrossEntropyLoss()),
+    #     nprocs=world_size,
+    #     join=True
+    # )
     # train_chex_model_dist(model, train_dl=train_dl, optimizer=torch.optim.Adam,
     #                       valid_dl=valid_dl, epochs=10,
     #                       lr_scheduler='OneCycle', max_lr=0.001,

@@ -589,7 +589,8 @@ def get_chexpert_labels(path: Path, dataframe: pd.DataFrame,
     file_name = str(path).split('/')[6:]
     file_name = '/'.join(file_name)
     full_id = f'CheXpert-v1.0/{data_type}/' + file_name
-    return list(dataframe.loc[full_id].values)[4:]
+    return torch.Tensor(list(map(int,
+                                 list(dataframe.loc[full_id].values)[4:])))
 
 
 def get_chexpert_images(path: Path, label_csv: str,
@@ -610,11 +611,9 @@ def get_chexpert_images(path: Path, label_csv: str,
         for file in files:
             if file.endswith('jpg'):
                 im_file = os.path.join(dirpath, file)
-                # img = cv2.imread(str(im_file)).astype(np.float32)
                 images.append(im_file)
                 label = get_chexpert_labels(im_file, label_info, data_type)
                 labels.append(label)
-    print(f'Dataset size: {len(labels)} images')
     return images, labels
 
 

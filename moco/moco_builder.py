@@ -182,7 +182,7 @@ class MoCo(nn.Module):
                 logits, targets
             """
 
-            # compute queryfeatures
+            # compute query features
             q = self.encoder_q(im_q)
             q = nn.functional.normalize(q, dim=1)
 

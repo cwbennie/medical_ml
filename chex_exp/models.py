@@ -206,4 +206,6 @@ class ChexNet(nn.Module):
         img = self.fc(img)
         if not self.binary:
             img = img.view(-1, self.classes, self.labels_pc)
+        else:
+            img = img.view(-1, self.classes)
         return img
