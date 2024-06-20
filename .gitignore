@@ -1,0 +1,3 @@
+local_only/
+temp_files/
+*/wandb/
